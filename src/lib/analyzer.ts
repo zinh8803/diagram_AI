@@ -48,11 +48,11 @@ export function shouldSkipFile(filePath: string, sizeBytes: number): { skip: boo
     }
   }
 
-  if (sizeBytes > 512 * 1024) {
-    return { skip: true, reason: 'File exceeds 512KB limit' };
+  if (sizeBytes > 2 * 1024 * 1024) {
+    return { skip: true, reason: 'File exceeds 2MB limit' };
   }
 
-  const allowedExt = /\.(php|vue|ts|tsx|js|jsx|sql)$/i;
+  const allowedExt = /\.(php|vue|ts|tsx|js|jsx|mjs|cjs|sql|json|prisma|py|go|java|rb|cs)$/i;
   if (!allowedExt.test(fileName)) {
     return { skip: true, reason: 'Unsupported or binary extension' };
   }
@@ -186,6 +186,100 @@ export function analyzeSourceFiles(
 
         symbols.push(tableSymbol);
         tableSymbolsByName.set(tableName, tableSymbol);
+      }
+
+      // 2. Standard SQL CREATE TABLE `table_name` (...)
+      const sqlCreateRegex = /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:`|")?([\w_]+)(?:`|")?\s*\(([\s\S]*?)\);/gi;
+      let sqlMatch: RegExpExecArray | null;
+      while ((sqlMatch = sqlCreateRegex.exec(content)) !== null) {
+        const tableName = sqlMatch[1];
+        if (tableSymbolsByName.has(tableName)) continue;
+        const body = sqlMatch[2];
+        const range = getLineRange(content, sqlMatch.index, 20);
+        const columns: TableColumn[] = [];
+
+        const colLines = body.split(',');
+        for (const rawCol of colLines) {
+          const colTrim = rawCol.trim();
+          const colDefMatch = colTrim.match(/^(?:`|")?([\w_]+)(?:`|")?\s+([A-Za-z0-9_]+(?:\([^)]+\))?)/i);
+          if (colDefMatch && !['PRIMARY', 'KEY', 'CONSTRAINT', 'FOREIGN'].includes(colDefMatch[1].toUpperCase())) {
+            const isPk = colTrim.toUpperCase().includes('PRIMARY KEY');
+            columns.push({
+              name: colDefMatch[1],
+              dataType: colDefMatch[2].toUpperCase(),
+              isPrimary: isPk,
+            });
+          }
+        }
+
+        const tableSymbol: CodeSymbol = {
+          id: `table:${tableName}`,
+          name: tableName,
+          label: `Table: ${tableName}`,
+          category: 'table',
+          layer: 'database',
+          filePath,
+          startLine: range.startLine,
+          endLine: range.endLine,
+          description: `Bảng cơ sở dữ liệu '${tableName}' (${columns.length} cột) được trích xuất từ file SQL.`,
+          codeSnippet: range.snippet,
+          confidence: 'Verified',
+          metadata: { columns },
+        };
+
+        symbols.push(tableSymbol);
+        tableSymbolsByName.set(tableName, tableSymbol);
+      }
+    }
+
+    // 3. Prisma Schema Models (schema.prisma)
+    if (filePath.endsWith('.prisma') || content.includes('datasource db') || content.includes('generator client')) {
+      dbEngines.add('Prisma ORM / MySQL');
+      const modelRegex = /model\s+(\w+)\s*\{([\s\S]*?)\}/g;
+      let pMatch: RegExpExecArray | null;
+      while ((pMatch = modelRegex.exec(content)) !== null) {
+        const modelName = pMatch[1];
+        const tableName = modelName.toLowerCase() + 's';
+        if (tableSymbolsByName.has(tableName) || tableSymbolsByName.has(modelName)) continue;
+
+        const body = pMatch[2];
+        const range = getLineRange(content, pMatch.index, 20);
+        const columns: TableColumn[] = [];
+
+        const pLines = body.split(/\r?\n/);
+        for (const line of pLines) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed.startsWith('//') || trimmed.startsWith('@@')) continue;
+          const parts = trimmed.split(/\s+/);
+          if (parts.length >= 2) {
+            const colName = parts[0];
+            const colType = parts[1];
+            const isId = trimmed.includes('@id');
+            columns.push({
+              name: colName,
+              dataType: colType,
+              isPrimary: isId,
+            });
+          }
+        }
+
+        const tableSymbol: CodeSymbol = {
+          id: `table:${modelName}`,
+          name: modelName,
+          label: `Table: ${modelName}`,
+          category: 'table',
+          layer: 'database',
+          filePath,
+          startLine: range.startLine,
+          endLine: range.endLine,
+          description: `Bảng dữ liệu Prisma Model '${modelName}' (${columns.length} trường).`,
+          codeSnippet: range.snippet,
+          confidence: 'Verified',
+          metadata: { columns },
+        };
+
+        symbols.push(tableSymbol);
+        tableSymbolsByName.set(modelName, tableSymbol);
       }
     }
   }
@@ -544,12 +638,68 @@ export function analyzeSourceFiles(
         }
       }
     }
+
+    // 4.2 Generic JS/TS Controllers & Handlers (Express, NestJS, etc.)
+    if ((filePath.endsWith('.js') || filePath.endsWith('.ts')) && (filePath.includes('/controllers/') || filePath.includes('Controller') || filePath.includes('/handlers/'))) {
+      const fileName = filePath.split('/').pop()?.replace(/\.(js|ts)$/, '') || 'Controller';
+      const cleanCtrlName = fileName.charAt(0).toUpperCase() + fileName.slice(1);
+
+      const jsFnRegex = /(?:async\s+function\s+(\w+)|(?:exports\.|const\s+)(\w+)\s*=\s*(?:async\s*)?(?:\([^)]*\)|req)\s*=>)/g;
+      let fnMatch: RegExpExecArray | null;
+      while ((fnMatch = jsFnRegex.exec(content)) !== null) {
+        const actionName = fnMatch[1] || fnMatch[2];
+        if (!actionName || actionName === 'module' || actionName === 'router') continue;
+
+        const range = getLineRange(content, fnMatch.index, 20);
+        const actionKey = `${cleanCtrlName}@${actionName}`;
+        const ctrlSym: CodeSymbol = {
+          id: `controller:${cleanCtrlName}@${actionName}`,
+          name: `${cleanCtrlName}.${actionName}()`,
+          label: `${cleanCtrlName}.${actionName}()`,
+          category: 'controller',
+          layer: 'backend',
+          filePath,
+          startLine: range.startLine,
+          endLine: range.endLine,
+          methodName: actionName,
+          description: `Backend action handler ${actionName}() trong ${filePath}.`,
+          codeSnippet: range.snippet,
+          confidence: 'Verified',
+        };
+
+        symbols.push(ctrlSym);
+        controllerSymbolsByAction.set(actionKey, ctrlSym);
+        controllerSymbolsByAction.set(actionName, ctrlSym);
+        controllerSymbolsByAction.set(`${fileName}.${actionName}`, ctrlSym);
+
+        // Check DB queries inside controller (Prisma, MySQL pool, Knex)
+        const dbQueryMatch = range.snippet.match(/(?:prisma|db|pool|connection)\.(\w+)\.(\w+)|(?:SELECT|INSERT|UPDATE|DELETE)\s+.*FROM\s+([`"]?[\w_]+[`"]?)/i);
+        if (dbQueryMatch) {
+          const targetTable = dbQueryMatch[1] || dbQueryMatch[3]?.replace(/[`"]/g, '');
+          if (targetTable) {
+            const tableSym = tableSymbolsByName.get(targetTable) || tableSymbolsByName.get(targetTable.toLowerCase() + 's');
+            if (tableSym) {
+              relations.push({
+                id: `rel:ctrl-db:${ctrlSym.id}->${tableSym.id}`,
+                sourceId: ctrlSym.id,
+                targetId: tableSym.id,
+                type: 'writes',
+                label: `DB Query '${tableSym.name}'`,
+                confidence: 'Verified',
+                evidence: `Database operation on ${tableSym.name} in ${filePath}:${range.startLine}`,
+              });
+            }
+          }
+        }
+      }
+    }
   }
 
   // -------------------------------------------------------------------------
-  // STAGE 5: PARSE LARAVEL ROUTES
+  // STAGE 5: PARSE ROUTES (LARAVEL & EXPRESS/NODEJS)
   // -------------------------------------------------------------------------
   for (const [filePath, content] of entries) {
+    // 5.1 Laravel Routes
     if (filePath.includes('routes/') && filePath.endsWith('.php')) {
       const routeRegex = /Route::(get|post|put|patch|delete)\(\s*['"]([^'"]+)['"]\s*,\s*\[\s*(\w+)::class\s*,\s*['"](\w+)['"]\s*\]\s*\)/gi;
       let rMatch: RegExpExecArray | null;
@@ -592,8 +742,59 @@ export function analyzeSourceFiles(
             confidence: 'Verified',
             evidence: `Route::${httpMethod.toLowerCase()}('${rawPath}', [${controllerClass}::class, '${actionName}'])`,
           });
-        } else {
-          warnings.push(`Route ${endpointKey} trỏ tới ${controllerClass}@${actionName} nhưng chưa tìm thấy method trong Controller.`);
+        }
+      }
+    }
+
+    // 5.2 Express / Node.js Router endpoints (router.get, router.post, app.get...)
+    if ((filePath.endsWith('.js') || filePath.endsWith('.ts')) && (filePath.includes('routes') || filePath.includes('controllers') || filePath.includes('api') || content.includes('express') || content.includes('Router()'))) {
+      const expressRouteRegex = /(?:app|router)\.(get|post|put|patch|delete)\(\s*['"`]([^'"`]+)['"`](?:[\s\S]*?(?:(\w+Controller)\.(\w+)|(\w+)))?/gi;
+      let exMatch: RegExpExecArray | null;
+      while ((exMatch = expressRouteRegex.exec(content)) !== null) {
+        backendFrameworks.add('Node.js / Express');
+        const httpMethod = exMatch[1].toUpperCase();
+        const rawPath = exMatch[2].startsWith('/') ? exMatch[2] : `/${exMatch[2]}`;
+        const endpointKey = `${httpMethod} ${rawPath}`;
+        if (routeSymbolsByEndpoint.has(endpointKey)) continue;
+
+        const range = getLineRange(content, exMatch.index, 8);
+        const routeSym: CodeSymbol = {
+          id: `route:${httpMethod}:${rawPath}`,
+          name: endpointKey,
+          label: `${httpMethod} ${rawPath}`,
+          category: 'route',
+          layer: 'backend',
+          filePath,
+          startLine: range.startLine,
+          endLine: range.endLine,
+          httpMethod,
+          endpointPath: rawPath,
+          description: `Express REST Endpoint ${httpMethod} ${rawPath} trong ${filePath}.`,
+          codeSnippet: range.snippet,
+          confidence: 'Verified',
+        };
+
+        symbols.push(routeSym);
+        routeSymbolsByEndpoint.set(endpointKey, routeSym);
+
+        // Link to controller if handler method is matched
+        const ctrlClass = exMatch[3];
+        const ctrlAction = exMatch[4] || exMatch[5];
+        if (ctrlAction) {
+          const targetCtrl =
+            (ctrlClass ? controllerSymbolsByAction.get(`${ctrlClass}@${ctrlAction}`) : null) ||
+            controllerSymbolsByAction.get(ctrlAction);
+          if (targetCtrl) {
+            relations.push({
+              id: `rel:route-ctrl:${routeSym.id}->${targetCtrl.id}`,
+              sourceId: routeSym.id,
+              targetId: targetCtrl.id,
+              type: 'calls',
+              label: `Dispatches to ${targetCtrl.label}`,
+              confidence: 'Verified',
+              evidence: `Express route dispatches to handler in ${filePath}`,
+            });
+          }
         }
       }
     }
@@ -755,23 +956,26 @@ export function analyzeSourceFiles(
   }
 
   // -------------------------------------------------------------------------
-  // STAGE 8: PARSE VUE/NUXT PAGES & COMPONENTS
+  // STAGE 8: PARSE FRONTEND PAGES & COMPONENTS (VUE, NUXT, REACT TSX/JSX)
   // -------------------------------------------------------------------------
-  const vueFiles = entries.filter(([filePath]) => filePath.endsWith('.vue'));
-  // First pass: create symbols for all Vue components & pages
-  for (const [filePath, content] of vueFiles) {
-    frontendFrameworks.add('Vue.js / Nuxt');
-    const isPage = filePath.includes('/pages/');
-    const rawName = filePath
-      .split('/')
-      .slice(isPage ? -2 : -1)
-      .join('/')
-      .replace(/\.vue$/, '')
-      .replace(/\/index$/, '');
+  const uiFiles = entries.filter(([filePath]) =>
+    filePath.endsWith('.vue') ||
+    ((filePath.endsWith('.tsx') || filePath.endsWith('.jsx')) && (filePath.includes('/components/') || filePath.includes('/pages/') || filePath.includes('/views/') || filePath.includes('/app/')))
+  );
 
-    const cleanName = isPage
-      ? `${rawName.charAt(0).toUpperCase()}${rawName.slice(1)}Page`
-      : filePath.split('/').pop()?.replace(/\.vue$/, '') || 'Component';
+  for (const [filePath, content] of uiFiles) {
+    const isVue = filePath.endsWith('.vue');
+    if (isVue) {
+      frontendFrameworks.add('Vue.js / Nuxt');
+    } else {
+      frontendFrameworks.add('React');
+    }
+
+    const isPage = filePath.includes('/pages/') || filePath.includes('/views/');
+    const rawFileName = filePath.split('/').pop()?.replace(/\.(vue|tsx|jsx)$/, '') || 'Component';
+    const cleanName = isPage && !rawFileName.toLowerCase().includes('page')
+      ? `${rawFileName.charAt(0).toUpperCase()}${rawFileName.slice(1)}Page`
+      : rawFileName;
 
     const lines = content.split(/\r?\n/);
     const sym: CodeSymbol = {
@@ -784,8 +988,8 @@ export function analyzeSourceFiles(
       startLine: 1,
       endLine: lines.length,
       description: isPage
-        ? `Trang giao diện người dùng (Nuxt/Vue Page: ${filePath}).`
-        : `Vue Component giao diện (${cleanName}).`,
+        ? `Trang giao diện người dùng (${filePath}).`
+        : `UI Component (${cleanName}).`,
       codeSnippet: content,
       confidence: 'Verified',
     };
@@ -794,50 +998,48 @@ export function analyzeSourceFiles(
     componentSymbolsByName.set(cleanName, sym);
   }
 
-  // Second pass: link Vue Pages -> Child Components, Composables, or direct API calls
-  for (const [filePath, content] of vueFiles) {
+  // Second pass: link UI components
+  for (const [filePath, content] of uiFiles) {
     const sourceSym = symbols.find((s) => s.filePath === filePath);
     if (!sourceSym) continue;
 
-    // Link Component/Page -> Imported Child Vue Components
     for (const [compName, targetCompSym] of componentSymbolsByName.entries()) {
       if (targetCompSym.id === sourceSym.id) continue;
-      const importRegex = new RegExp(`import\\s+${compName}\\s+from`, 'i');
       const tagRegex = new RegExp(`<${compName}\\b`);
-      if (importRegex.test(content) || tagRegex.test(content)) {
+      if (tagRegex.test(content)) {
         relations.push({
-          id: `rel:vue-render:${sourceSym.id}->${targetCompSym.id}`,
+          id: `rel:ui-render:${sourceSym.id}->${targetCompSym.id}`,
           sourceId: sourceSym.id,
           targetId: targetCompSym.id,
           type: 'renders',
           label: `Renders <${compName} />`,
           confidence: 'Verified',
-          evidence: `Template renders <${compName}> in ${filePath}`,
+          evidence: `Render <${compName}> in ${filePath}`,
         });
       }
     }
 
-    // Link Component/Page -> Composable methods called
+    // Link Component/Page -> Composable or Hook calls
     for (const [fnName, compMethodSym] of composableMethods.entries()) {
       const fnCallRegex = new RegExp(`\\b${fnName}\\s*\\(`);
       if (fnCallRegex.test(content)) {
         relations.push({
-          id: `rel:vue-composable:${sourceSym.id}->${compMethodSym.id}`,
+          id: `rel:ui-hook:${sourceSym.id}->${compMethodSym.id}`,
           sourceId: sourceSym.id,
           targetId: compMethodSym.id,
           type: 'calls',
           label: `Triggers ${fnName}()`,
           confidence: 'Verified',
-          evidence: `Invokes composable method ${fnName}() in ${filePath}`,
+          evidence: `Invokes ${fnName}() in ${filePath}`,
         });
       }
     }
 
-    // Link Component/Page -> Direct API client calls (e.g., login.vue calling authApi.login)
+    // Link Component/Page -> API calls
     for (const [clientKey, clientInfo] of apiClientMethods.entries()) {
       if (content.includes(`${clientKey}(`)) {
         relations.push({
-          id: `rel:vue-api:${sourceSym.id}->${clientInfo.symbol.id}`,
+          id: `rel:ui-api:${sourceSym.id}->${clientInfo.symbol.id}`,
           sourceId: sourceSym.id,
           targetId: clientInfo.symbol.id,
           type: 'calls',
@@ -942,6 +1144,21 @@ export function analyzeSourceFiles(
       symbolIds: Array.from(flowSymIds),
       relationIds: Array.from(flowRelIds),
       warnings: [],
+    });
+  }
+
+  // Universal Dynamic Fallback: Nếu không tìm thấy Route RESTful chuẩn, tự động sinh các Flow theo nhóm chức năng đã phân tích
+  if (featureFlows.length === 0 && symbols.length > 0) {
+    featureFlows.push({
+      id: 'flow:overview_default',
+      name: 'Toàn bộ cấu trúc hệ thống (Universal Architecture Flow)',
+      description: 'Hệ thống tự động phát hiện và kết nối toàn bộ các thành phần Frontend, Backend và Database trong dự án.',
+      httpMethod: 'ALL',
+      endpointPath: '/*',
+      entrySymbolId: symbols[0].id,
+      symbolIds: symbols.map((s) => s.id),
+      relationIds: relations.map((r) => r.id),
+      warnings: ['Dự án không dùng khuôn mẫu Laravel thông thường. CodeFlow đã tự động quét toàn diện và sinh đồ thị liên kết động.'],
     });
   }
 

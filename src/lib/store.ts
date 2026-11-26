@@ -3,8 +3,6 @@ import path from 'path';
 import { Project } from '@/types/codeflow';
 import { analyzeSourceFiles, shouldSkipFile } from '@/lib/analyzer';
 
-const DATA_DIR = path.join(process.cwd(), '.codeflow-data');
-const DB_FILE = path.join(DATA_DIR, 'projects.json');
 const SAMPLE_DIR = path.join(process.cwd(), 'sample-projects', 'sharespend');
 
 function readDirectoryRecursive(dirPath: string, baseDir = dirPath): { files: Record<string, string>; skipped: number } {
@@ -47,7 +45,10 @@ export function loadSourceFromLocalDirectory(dirPath: string): { files: Record<s
   return readDirectoryRecursive(dirPath, dirPath);
 }
 
-function createSeedShareSpendProject(): Project {
+/**
+ * Trả về dự án mẫu ShareSpend cho người dùng lần đầu truy cập
+ */
+export function getSampleShareSpendProject(): Project {
   const projectId = 'proj_sharespend_demo';
   const { files, skipped } = readDirectoryRecursive(SAMPLE_DIR);
   const { run, diagrams } = analyzeSourceFiles(projectId, 'commit-8f4d2a1 (main)', files, skipped);
@@ -67,63 +68,4 @@ function createSeedShareSpendProject(): Project {
     analysisRuns: [run],
     diagrams,
   };
-}
-
-export function getAllProjects(): Project[] {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-
-  if (!fs.existsSync(DB_FILE)) {
-    const seed = [createSeedShareSpendProject()];
-    fs.writeFileSync(DB_FILE, JSON.stringify(seed, null, 2), 'utf-8');
-    return seed;
-  }
-
-  try {
-    const raw = fs.readFileSync(DB_FILE, 'utf-8');
-    const parsed = JSON.parse(raw) as Project[];
-    if (!Array.isArray(parsed) || parsed.length === 0) {
-      const seed = [createSeedShareSpendProject()];
-      fs.writeFileSync(DB_FILE, JSON.stringify(seed, null, 2), 'utf-8');
-      return seed;
-    }
-    return parsed;
-  } catch {
-    const seed = [createSeedShareSpendProject()];
-    fs.writeFileSync(DB_FILE, JSON.stringify(seed, null, 2), 'utf-8');
-    return seed;
-  }
-}
-
-export function saveAllProjects(projects: Project[]): void {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-  fs.writeFileSync(DB_FILE, JSON.stringify(projects, null, 2), 'utf-8');
-}
-
-export function getProjectById(projectId: string): Project | undefined {
-  const projects = getAllProjects();
-  return projects.find((p) => p.id === projectId);
-}
-
-export function upsertProject(project: Project): Project {
-  const projects = getAllProjects();
-  const idx = projects.findIndex((p) => p.id === project.id);
-  if (idx >= 0) {
-    projects[idx] = project;
-  } else {
-    projects.unshift(project);
-  }
-  saveAllProjects(projects);
-  return project;
-}
-
-export function deleteProjectById(projectId: string): boolean {
-  const projects = getAllProjects();
-  const filtered = projects.filter((p) => p.id !== projectId);
-  if (filtered.length === projects.length) return false;
-  saveAllProjects(filtered);
-  return true;
 }

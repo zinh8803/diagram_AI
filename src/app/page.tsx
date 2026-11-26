@@ -29,6 +29,7 @@ import {
   X,
   Check,
   Terminal,
+  Trash2,
 } from 'lucide-react';
 import InteractiveFlowCanvas from '@/components/InteractiveFlowCanvas';
 import CodeInspectorPanel from '@/components/CodeInspectorPanel';
@@ -43,6 +44,11 @@ import {
   generatePlantUmlForFlow,
   generateSequenceMermaid,
 } from '@/lib/analyzer';
+import {
+  getClientProjects,
+  saveClientProject,
+  deleteClientProject,
+} from '@/lib/clientStorage';
 
 type ActiveTab = 'flowchart' | 'sequence' | 'erd' | 'architecture' | 'code_search';
 
@@ -88,7 +94,7 @@ export default function CodeFlowWorkspacePage() {
   const [manualNodeLayer, setManualNodeLayer] = useState<'frontend' | 'backend' | 'database' | 'external'>('backend');
   const [manualNodeDesc, setManualNodeDesc] = useState('');
 
-  // Load initial projects
+  // Load initial projects from browser's private client storage
   useEffect(() => {
     fetchProjects();
   }, []);
@@ -99,12 +105,23 @@ export default function CodeFlowWorkspacePage() {
   }
 
   async function fetchProjects() {
-    const res = await fetch('/api/projects');
-    const data = await res.json();
-    if (data.projects && data.projects.length > 0) {
-      setProjects(data.projects);
-      const firstProj = data.projects[0] as Project;
-      selectProject(firstProj);
+    try {
+      const clientProjs = await getClientProjects();
+      if (clientProjs && clientProjs.length > 0) {
+        setProjects(clientProjs);
+        selectProject(clientProjs[0]);
+      } else {
+        // If client has no projects yet, fetch the default ShareSpend demo seed and save to client storage
+        const res = await fetch('/api/projects');
+        const data = await res.json();
+        if (data.sampleProject) {
+          await saveClientProject(data.sampleProject);
+          setProjects([data.sampleProject]);
+          selectProject(data.sampleProject);
+        }
+      }
+    } catch (err) {
+      console.error('Error fetching client projects:', err);
     }
   }
 
@@ -246,25 +263,43 @@ export default function CodeFlowWorkspacePage() {
 
   async function handleSaveDiagramVersion() {
     if (!activeProject || !activeDiagram) return;
-    const res = await fetch('/api/projects', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'save_diagram_version',
-        projectId: activeProject.id,
-        diagramId: activeDiagram.id,
-        versionName: `Bản chỉnh sửa v${activeDiagram.versions.length + 1} (${new Date().toLocaleTimeString('vi-VN')})`,
-        nodes,
-        edges,
-        direction,
-      }),
+
+    const nextVerNum = activeDiagram.versions.length + 1;
+    const prevVer = activeDiagram.versions[activeDiagram.versions.length - 1];
+
+    const newVer = {
+      id: `ver_${Date.now()}`,
+      versionNumber: nextVerNum,
+      name: `Bản chỉnh sửa v${nextVerNum} (${new Date().toLocaleTimeString('vi-VN')})`,
+      createdAt: new Date().toISOString(),
+      nodes,
+      edges,
+      mermaidCode: prevVer?.mermaidCode || '',
+      plantUmlCode: prevVer?.plantUmlCode || '',
+    };
+
+    const updatedDiagrams = activeProject.diagrams.map((d) => {
+      if (d.id === activeDiagram.id) {
+        return {
+          ...d,
+          direction,
+          currentVersion: nextVerNum,
+          versions: [...d.versions, newVer],
+          updatedAt: new Date().toISOString(),
+        };
+      }
+      return d;
     });
-    const data = await res.json();
-    if (data.project) {
-      setProjects((prev) => prev.map((p) => (p.id === data.project.id ? data.project : p)));
-      setActiveVersionNum(data.diagram.currentVersion);
-      notify(`Đã lưu phiên bản sơ đồ mới (v${data.diagram.currentVersion}) mà không ghi đè bản phân tích gốc!`);
-    }
+
+    const updatedProject: Project = {
+      ...activeProject,
+      diagrams: updatedDiagrams,
+    };
+
+    await saveClientProject(updatedProject);
+    setProjects((prev) => prev.map((p) => (p.id === updatedProject.id ? updatedProject : p)));
+    setActiveVersionNum(nextVerNum);
+    notify(`Đã lưu phiên bản sơ đồ mới (v${nextVerNum}) an toàn trên trình duyệt của bạn!`);
   }
 
   async function handleReanalyzeProject() {
@@ -276,18 +311,44 @@ export default function CodeFlowWorkspacePage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           action: 'reanalyze',
-          projectId: activeProject.id,
+          project: activeProject,
         }),
       });
       const data = await res.json();
-      if (data.project && data.newRun) {
-        setProjects((prev) => prev.map((p) => (p.id === data.project.id ? data.project : p)));
-        selectProject(data.project, data.newRun.id);
+      if (data.newRun && data.newDiagrams) {
+        const updatedProject: Project = {
+          ...activeProject,
+          analysisRuns: [data.newRun, ...activeProject.analysisRuns],
+          diagrams: [...data.newDiagrams, ...activeProject.diagrams],
+          lastAnalyzedAt: data.newRun.completedAt,
+        };
+        await saveClientProject(updatedProject);
+        setProjects((prev) => prev.map((p) => (p.id === updatedProject.id ? updatedProject : p)));
+        selectProject(updatedProject, data.newRun.id);
         notify(`Phân tích lại thành công! Đã tạo phiên bản phân tích mới: ${data.newRun.versionTag}`);
       }
     } finally {
       setIsAnalyzing(false);
     }
+  }
+
+  async function handleDeleteCurrentProject() {
+    if (!activeProject) return;
+    const confirmDel = window.confirm(`Bạn có chắc muốn xóa dự án "${activeProject.name}" khỏi trình duyệt của bạn?`);
+    if (!confirmDel) return;
+
+    await deleteClientProject(activeProject.id);
+    const remaining = projects.filter((p) => p.id !== activeProject.id);
+    setProjects(remaining);
+    if (remaining.length > 0) {
+      selectProject(remaining[0]);
+    } else {
+      setActiveProjectId('');
+      setNodes([]);
+      setEdges([]);
+      setSelectedNode(null);
+    }
+    notify(`Đã xóa dự án "${activeProject.name}".`);
   }
 
   async function handleCreateProjectSubmit(e: React.FormEvent) {
@@ -328,13 +389,15 @@ export default function CodeFlowWorkspacePage() {
       }
 
       if (data.project) {
+        // Save to browser client storage so only this user sees it
+        await saveClientProject(data.project);
         setProjects((prev) => [data.project, ...prev]);
         selectProject(data.project);
         setShowNewProjectModal(false);
         setNewProjName('');
         setNewProjDesc('');
         setZipFile(null);
-        notify(`Đã phân tích thành công dự án "${data.project.name}"!`);
+        notify(`Đã phân tích thành công dự án "${data.project.name}" và lưu riêng trên máy bạn!`);
       }
     } finally {
       setIsAnalyzing(false);
@@ -556,6 +619,16 @@ export default function CodeFlowWorkspacePage() {
             >
               <RefreshCw className={`w-3.5 h-3.5 ${isAnalyzing ? 'animate-spin text-cyan-400' : ''}`} />
             </button>
+
+            {activeProject && (
+              <button
+                onClick={handleDeleteCurrentProject}
+                title="Xóa dự án này khỏi trình duyệt"
+                className="p-1.5 rounded-lg bg-slate-800 hover:bg-red-950/60 text-slate-400 hover:text-red-400 border border-slate-700 transition"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+              </button>
+            )}
           </div>
         </div>
 
@@ -655,7 +728,13 @@ export default function CodeFlowWorkspacePage() {
                 <span>Luồng nghiệp vụ & API ({filteredFlows.length})</span>
               </div>
               <div className="space-y-1.5">
-                {filteredFlows.map((flow) => {
+                {filteredFlows.length === 0 ? (
+                  <div className="p-3 rounded-xl bg-slate-900/40 border border-slate-800 text-center">
+                    <p className="text-xs text-slate-400">Không có luồng API riêng lẻ.</p>
+                    <p className="text-[11px] text-slate-500 mt-1">Hãy xem Sơ đồ ERD hoặc Kiến trúc tổng thể ở bên dưới.</p>
+                  </div>
+                ) : (
+                  filteredFlows.map((flow) => {
                   const isSelected =
                     activeFlow?.id === flow.id &&
                     (activeTab === 'flowchart' || activeTab === 'sequence');
@@ -698,7 +777,7 @@ export default function CodeFlowWorkspacePage() {
                       <div className="text-xs font-semibold leading-snug">{flow.name}</div>
                     </button>
                   );
-                })}
+                }))}
               </div>
             </div>
 
@@ -1497,24 +1576,14 @@ export default function CodeFlowWorkspacePage() {
                 <div className="grid grid-cols-2 gap-2">
                   <button
                     onClick={async () => {
-                      if (!activeProject) return;
-                      const res = await fetch('/api/projects', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                          action: 'save_diagram_version',
-                          projectId: activeProject.id,
-                          diagramId: activeDiagram.id,
-                          nodes,
-                          edges,
-                          visibility: 'Private',
-                        }),
-                      });
-                      const data = await res.json();
-                      if (data.project) {
-                        setProjects((prev) => prev.map((p) => (p.id === data.project.id ? data.project : p)));
-                        notify('Đã chuyển sơ đồ sang chế độ Private.');
-                      }
+                      if (!activeProject || !activeDiagram) return;
+                      const updatedDiagrams = activeProject.diagrams.map((d) =>
+                        d.id === activeDiagram.id ? { ...d, visibility: 'Private' as const } : d
+                      );
+                      const updatedProject: Project = { ...activeProject, diagrams: updatedDiagrams };
+                      await saveClientProject(updatedProject);
+                      setProjects((prev) => prev.map((p) => (p.id === updatedProject.id ? updatedProject : p)));
+                      notify('Đã chuyển sơ đồ sang chế độ Private.');
                     }}
                     className={`p-3 rounded-xl border text-left flex items-start gap-2.5 transition ${
                       activeDiagram.visibility === 'Private'
@@ -1525,30 +1594,20 @@ export default function CodeFlowWorkspacePage() {
                     <Lock className="w-4 h-4 text-indigo-400 shrink-0 mt-0.5" />
                     <div>
                       <div className="font-bold">Private</div>
-                      <div className="text-[10px] text-slate-400">Chỉ chủ sở hữu project được xem</div>
+                      <div className="text-[10px] text-slate-400">Chỉ trên trình duyệt máy bạn</div>
                     </div>
                   </button>
 
                   <button
                     onClick={async () => {
-                      if (!activeProject) return;
-                      const res = await fetch('/api/projects', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                          action: 'save_diagram_version',
-                          projectId: activeProject.id,
-                          diagramId: activeDiagram.id,
-                          nodes,
-                          edges,
-                          visibility: 'Public',
-                        }),
-                      });
-                      const data = await res.json();
-                      if (data.project) {
-                        setProjects((prev) => prev.map((p) => (p.id === data.project.id ? data.project : p)));
-                        notify('Đã bật chia sẻ Public link cho sơ đồ.');
-                      }
+                      if (!activeProject || !activeDiagram) return;
+                      const updatedDiagrams = activeProject.diagrams.map((d) =>
+                        d.id === activeDiagram.id ? { ...d, visibility: 'Public' as const } : d
+                      );
+                      const updatedProject: Project = { ...activeProject, diagrams: updatedDiagrams };
+                      await saveClientProject(updatedProject);
+                      setProjects((prev) => prev.map((p) => (p.id === updatedProject.id ? updatedProject : p)));
+                      notify('Đã bật chia sẻ Public link cho sơ đồ.');
                     }}
                     className={`p-3 rounded-xl border text-left flex items-start gap-2.5 transition ${
                       activeDiagram.visibility === 'Public'
