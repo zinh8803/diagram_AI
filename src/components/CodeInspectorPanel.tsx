@@ -84,8 +84,8 @@ export default function CodeInspectorPanel({
 
   function startEdit() {
     if (!selectedNode) return;
-    setEditLabel(selectedNode.label);
-    setEditDesc(selectedNode.description);
+    setEditLabel(selectedNode.label || '');
+    setEditDesc(selectedNode.description || '');
     setIsEditing(true);
   }
 
@@ -163,7 +163,7 @@ export default function CodeInspectorPanel({
             <div>
               <label className="text-[11px] text-slate-400 block mb-1">Tên thành phần (Node Label)</label>
               <input
-                value={editLabel}
+                value={editLabel ?? ''}
                 onChange={(e) => setEditLabel(e.target.value)}
                 className="w-full px-2.5 py-1.5 text-xs rounded-lg bg-slate-950 border border-slate-700 text-slate-100 focus:outline-none focus:border-indigo-500"
               />
@@ -172,7 +172,7 @@ export default function CodeInspectorPanel({
               <label className="text-[11px] text-slate-400 block mb-1">Mô tả vai trò</label>
               <textarea
                 rows={3}
-                value={editDesc}
+                value={editDesc ?? ''}
                 onChange={(e) => setEditDesc(e.target.value)}
                 className="w-full px-2.5 py-1.5 text-xs rounded-lg bg-slate-950 border border-slate-700 text-slate-100 focus:outline-none focus:border-indigo-500"
               />

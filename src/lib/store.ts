@@ -1,48 +1,38 @@
 import fs from 'fs';
 import path from 'path';
 import { Project } from '@/types/codeflow';
-import { analyzeSourceFiles, shouldSkipFile } from '@/lib/analyzer';
+import { analyzeSourceFiles } from '@/lib/analyzer';
+import { decodeSource, shouldSkipDirectory, shouldSkipFile } from '@/lib/sourceFiles';
 
 const SAMPLE_DIR = path.join(process.cwd(), 'sample-projects', 'sharespend');
 
-function readDirectoryRecursive(dirPath: string, baseDir = dirPath): { files: Record<string, string>; skipped: number } {
-  const files: Record<string, string> = {};
+export function loadSourceFromLocalDirectory(dirPath: string): { files: Record<string, string>; skipped: number } {
+  const files: Record<string, string> = Object.create(null);
   let skipped = 0;
-
-  if (!fs.existsSync(dirPath)) {
-    return { files, skipped };
-  }
-
-  const entries = fs.readdirSync(dirPath, { withFileTypes: true });
-  for (const entry of entries) {
-    const fullPath = path.join(dirPath, entry.name);
-    const relPath = path.relative(baseDir, fullPath).replace(/\\/g, '/');
-
-    if (entry.isDirectory()) {
-      const checkDir = shouldSkipFile(relPath + '/dummy.ts', 10);
-      if (checkDir.reason === 'Ignored directory') {
+  function scan(directory: string) {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const fullPath = path.join(directory, entry.name);
+      const relPath = path.relative(dirPath, fullPath).replace(/\\/g, '/');
+      try {
+        if (entry.isDirectory()) {
+          if (shouldSkipDirectory(relPath)) skipped++;
+          else scan(fullPath);
+        } else if (entry.isFile() && !shouldSkipFile(relPath, fs.statSync(fullPath).size).skip) {
+          const content = decodeSource(fs.readFileSync(fullPath));
+          if (content === undefined) skipped++;
+          else files[relPath] = content;
+        } else {
+          skipped++;
+        }
+      } catch (error) {
+        // A file may move during the scan or a nested folder may be unreadable.
+        if (!['EACCES', 'EPERM', 'ENOENT', 'EBUSY', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code || '')) throw error;
         skipped++;
-        continue;
       }
-      const sub = readDirectoryRecursive(fullPath, baseDir);
-      Object.assign(files, sub.files);
-      skipped += sub.skipped;
-    } else if (entry.isFile()) {
-      const stat = fs.statSync(fullPath);
-      const check = shouldSkipFile(relPath, stat.size);
-      if (check.skip) {
-        skipped++;
-        continue;
-      }
-      files[relPath] = fs.readFileSync(fullPath, 'utf-8');
     }
   }
-
+  scan(dirPath);
   return { files, skipped };
-}
-
-export function loadSourceFromLocalDirectory(dirPath: string): { files: Record<string, string>; skipped: number } {
-  return readDirectoryRecursive(dirPath, dirPath);
 }
 
 /**
@@ -50,7 +40,7 @@ export function loadSourceFromLocalDirectory(dirPath: string): { files: Record<s
  */
 export function getSampleShareSpendProject(): Project {
   const projectId = 'proj_sharespend_demo';
-  const { files, skipped } = readDirectoryRecursive(SAMPLE_DIR);
+  const { files, skipped } = loadSourceFromLocalDirectory(SAMPLE_DIR);
   const { run, diagrams } = analyzeSourceFiles(projectId, 'commit-8f4d2a1 (main)', files, skipped);
 
   return {

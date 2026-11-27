@@ -1,8 +1,10 @@
 export type ConfidenceLevel = 'Verified' | 'Inferred' | 'Unknown';
 
-export type LayerType = 'frontend' | 'backend' | 'database' | 'external';
+export type LayerType = 'frontend' | 'backend' | 'database' | 'external' | 'source';
 
 export type SymbolCategory =
+  | 'module'
+  | 'function'
   | 'page'
   | 'component'
   | 'composable'
@@ -18,6 +20,7 @@ export type SymbolCategory =
   | 'manual';
 
 export type RelationType =
+  | 'defines'
   | 'renders'
   | 'calls'
   | 'imports'
@@ -85,9 +88,11 @@ export interface CodeRelation {
   label: string;
   confidence: ConfidenceLevel;
   evidence?: string;
+  importPath?: string;
 }
 
 export interface FeatureFlow {
+  kind?: 'endpoint' | 'modules' | 'code';
   id: string;
   name: string;
   description: string;
@@ -162,6 +167,7 @@ export interface AnalysisStageProgress {
 }
 
 export interface AnalysisRun {
+  languages?: string[];
   id: string;
   projectId: string;
   versionTag: string;

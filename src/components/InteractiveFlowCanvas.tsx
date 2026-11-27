@@ -65,6 +65,13 @@ const LAYER_STYLES: Record<
     badgeText: 'text-purple-300',
     title: 'MANUAL / EXT',
   },
+  source: {
+    border: 'border-sky-500/60 hover:border-sky-400',
+    bg: 'bg-gradient-to-br from-sky-950/90 via-slate-900/95 to-slate-900/95',
+    badgeBg: 'bg-sky-500/20 border-sky-500/40',
+    badgeText: 'text-sky-300',
+    title: 'SOURCE MODULE',
+  },
 };
 
 function CategoryIcon({ category }: { category: string }) {

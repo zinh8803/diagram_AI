@@ -40,15 +40,17 @@ import {
   Project,
 } from '@/types/codeflow';
 import {
+  generateArchitectureMermaid,
   generateMermaidForFlow,
   generatePlantUmlForFlow,
   generateSequenceMermaid,
-} from '@/lib/analyzer';
+} from '@/lib/diagramText';
 import {
   getClientProjects,
   saveClientProject,
   deleteClientProject,
 } from '@/lib/clientStorage';
+import { shouldSkipFile } from '@/lib/sourceFiles';
 
 type ActiveTab = 'flowchart' | 'sequence' | 'erd' | 'architecture' | 'code_search';
 
@@ -70,6 +72,7 @@ export default function CodeFlowWorkspacePage() {
 
   // Search & Trace (Section 7.1 & 7.3)
   const [searchQuery, setSearchQuery] = useState('');
+  const [flowKindFilter, setFlowKindFilter] = useState<'all' | 'endpoint' | 'code' | 'modules'>('all');
   const [codeTraceQuery, setCodeTraceQuery] = useState('');
   const [selectedFileInExplorer, setSelectedFileInExplorer] = useState<string>('');
 
@@ -80,12 +83,13 @@ export default function CodeFlowWorkspacePage() {
   const [showShareModal, setShowShareModal] = useState(false);
 
   // New project form state
-  const [uploadMode, setUploadMode] = useState<'zip' | 'local'>('zip');
+  const [uploadMode, setUploadMode] = useState<'zip' | 'folder' | 'local'>('folder');
   const [newProjName, setNewProjName] = useState('');
   const [newProjDesc, setNewProjDesc] = useState('');
   const [newProjBranch, setNewProjBranch] = useState('main');
   const [newProjLocalPath, setNewProjLocalPath] = useState('');
   const [zipFile, setZipFile] = useState<File | null>(null);
+  const [folderFiles, setFolderFiles] = useState<File[]>([]);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
 
@@ -127,6 +131,9 @@ export default function CodeFlowWorkspacePage() {
 
   function selectProject(proj: Project, runIdOverride?: string) {
     setActiveProjectId(proj.id);
+    setActiveTab('flowchart');
+    setSearchQuery('');
+    setCodeTraceQuery('');
     const targetRun =
       proj.analysisRuns.find((r) => r.id === runIdOverride) ||
       proj.analysisRuns[0];
@@ -139,6 +146,11 @@ export default function CodeFlowWorkspacePage() {
       if (targetRun.featureFlows.length > 0) {
         const firstFlow = targetRun.featureFlows[0];
         loadFlowDiagram(proj, targetRun.id, firstFlow.id);
+      } else {
+        setActiveFlowId('');
+        setSelectedNode(null);
+        setNodes([]);
+        setEdges([]);
       }
     }
   }
@@ -311,13 +323,18 @@ export default function CodeFlowWorkspacePage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           action: 'reanalyze',
-          project: activeProject,
+          project: {
+            id: activeProject.id, rootPath: activeProject.rootPath, sourceType: activeProject.sourceType,
+            analysisRuns: activeProject.analysisRuns.map((run, i) => i === 0 ? { sourceFiles: run.sourceFiles, stats: run.stats } : {}),
+          },
         }),
       });
       const data = await res.json();
+      if (!res.ok) { notify(data.error || 'Không thể phân tích lại dự án.'); return; }
       if (data.newRun && data.newDiagrams) {
         const updatedProject: Project = {
           ...activeProject,
+          mainLanguages: data.newRun.languages ?? activeProject.mainLanguages,
           analysisRuns: [data.newRun, ...activeProject.analysisRuns],
           diagrams: [...data.newDiagrams, ...activeProject.diagrams],
           lastAnalyzedAt: data.newRun.completedAt,
@@ -327,6 +344,8 @@ export default function CodeFlowWorkspacePage() {
         selectProject(updatedProject, data.newRun.id);
         notify(`Phân tích lại thành công! Đã tạo phiên bản phân tích mới: ${data.newRun.versionTag}`);
       }
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'Không thể hoàn tất phân tích dự án.');
     } finally {
       setIsAnalyzing(false);
     }
@@ -368,6 +387,37 @@ export default function CodeFlowWorkspacePage() {
         fd.append('defaultBranch', newProjBranch || 'main');
         fd.append('zipFile', zipFile);
         res = await fetch('/api/projects', { method: 'POST', body: fd });
+      } else if (uploadMode === 'folder') {
+        if (folderFiles.length === 0) {
+          notify('Vui lòng chọn thư mục dự án trên máy!');
+          setIsAnalyzing(false);
+          return;
+        }
+        const rawFiles: Record<string, string> = {};
+        let detectedRootName = '';
+        for (const f of folderFiles) {
+          const relPath = (f.webkitRelativePath || f.name).replace(/\\/g, '/');
+          if (!detectedRootName && relPath.includes('/')) {
+            detectedRootName = relPath.split('/')[0];
+          }
+          if (shouldSkipFile(relPath, f.size).skip) continue;
+          try {
+            rawFiles[relPath] = await f.text();
+          } catch {
+            // Skip unreadable file
+          }
+        }
+        res = await fetch('/api/projects', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'create_from_files',
+            name: newProjName || detectedRootName || 'Local Folder Project',
+            description: newProjDesc || `Dự án chọn trực tiếp từ thư mục (${Object.keys(rawFiles).length} files)`,
+            defaultBranch: newProjBranch || 'main',
+            rawFiles,
+          }),
+        });
       } else {
         res = await fetch('/api/projects', {
           method: 'POST',
@@ -397,8 +447,11 @@ export default function CodeFlowWorkspacePage() {
         setNewProjName('');
         setNewProjDesc('');
         setZipFile(null);
-        notify(`Đã phân tích thành công dự án "${data.project.name}" và lưu riêng trên máy bạn!`);
+        setFolderFiles([]);
+        notify(`Đã phân tích thành công dự án "${data.project.name}" (${data.project.analysisRuns[0]?.stats.filesScanned || 0} files)!`);
       }
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'Không thể hoàn tất phân tích dự án.');
     } finally {
       setIsAnalyzing(false);
     }
@@ -407,19 +460,26 @@ export default function CodeFlowWorkspacePage() {
   // Filtered Feature Flows in sidebar (Section 7.1)
   const filteredFlows = useMemo(() => {
     if (!activeRun) return [];
-    if (!searchQuery.trim()) return activeRun.featureFlows;
+    const byKind =
+      flowKindFilter === 'all'
+        ? activeRun.featureFlows
+        : activeRun.featureFlows.filter((f) => (f.kind || 'endpoint') === flowKindFilter);
+
+    if (!searchQuery.trim()) return byKind;
     const q = searchQuery.toLowerCase();
-    return activeRun.featureFlows.filter(
+    return byKind.filter(
       (f) =>
         f.name.toLowerCase().includes(q) ||
         f.endpointPath?.toLowerCase().includes(q) ||
-        f.description.toLowerCase().includes(q)
+        f.description.toLowerCase().includes(q) ||
+        f.symbolIds.some((id) => id.toLowerCase().includes(q))
     );
-  }, [activeRun, searchQuery]);
+  }, [activeRun, searchQuery, flowKindFilter]);
 
   // Dynamic Mermaid & PlantUML codes for current view
   const currentMermaidCode = useMemo(() => {
     if (!activeRun) return '';
+    if (activeTab === 'architecture') return generateArchitectureMermaid(activeRun);
     if (activeTab === 'sequence' && activeFlow) {
       return generateSequenceMermaid(activeFlow, nodes, edges);
     }
@@ -435,42 +495,6 @@ export default function CodeFlowWorkspacePage() {
   const currentPlantUmlCode = useMemo(() => {
     return generatePlantUmlForFlow(activeFlow?.name || 'CodeFlow Diagram', nodes, edges);
   }, [activeFlow, nodes, edges]);
-
-  // Architecture Overview Mermaid (Section 6.4)
-  const architectureMermaidCode = useMemo(() => {
-    if (!activeRun) return '';
-    const feSyms = activeRun.symbols.filter((s) => s.layer === 'frontend');
-    const beSyms = activeRun.symbols.filter((s) => s.layer === 'backend');
-    const dbSyms = activeRun.symbols.filter((s) => s.layer === 'database');
-
-    const lines: string[] = ['flowchart TB'];
-    const clean = (id: string) => id.replace(/[^a-zA-Z0-9_]/g, '_');
-
-    lines.push('    subgraph FE["Frontend Layer (Vue.js / Nuxt)"]');
-    for (const s of feSyms) {
-      lines.push(`        ${clean(s.id)}["${s.label}"]`);
-    }
-    lines.push('    end');
-
-    lines.push('    subgraph BE["Backend Layer (PHP Laravel)"]');
-    for (const s of beSyms) {
-      lines.push(`        ${clean(s.id)}["${s.label}"]`);
-    }
-    lines.push('    end');
-
-    lines.push('    subgraph DB["Database Layer (MySQL)"]');
-    for (const s of dbSyms) {
-      lines.push(`        ${clean(s.id)}[("${s.name}")]`);
-    }
-    lines.push('    end');
-
-    for (const r of activeRun.relations) {
-      if (r.type === 'foreign_key') continue;
-      lines.push(`    ${clean(r.sourceId)} -->|"${r.label}"| ${clean(r.targetId)}`);
-    }
-
-    return lines.join('\n');
-  }, [activeRun]);
 
   // Trace from Code -> Diagram (Section 7.3)
   const traceSymbolsMatchingCode = useMemo(() => {
@@ -580,7 +604,7 @@ export default function CodeFlowWorkspacePage() {
             >
               {projects.map((p) => (
                 <option key={p.id} value={p.id}>
-                  {p.name} [{p.sourceType}]
+                  {p.name} [{p.sourceType === 'GitHub' && p.rootPath === p.repositoryUrl ? 'Local' : p.sourceType}]
                 </option>
               ))}
             </select>
@@ -642,7 +666,7 @@ export default function CodeFlowWorkspacePage() {
               </span>
               <span className="text-slate-600">|</span>
               <span className="text-slate-300">
-                <strong className="text-white">{activeRun.stats.filesScanned}</strong> files
+                <strong className="text-white">{activeRun.stats.filesScanned}</strong> file đã đọc · {activeRun.stats.filesSkipped} mục bỏ qua
               </span>
               <span className="text-slate-600">·</span>
               <span className="text-emerald-300">
@@ -683,9 +707,9 @@ export default function CodeFlowWorkspacePage() {
               <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
               <input
                 type="text"
-                value={searchQuery}
+                value={searchQuery ?? ''}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Tìm chức năng, API (VD: chi tiêu, login)..."
+                placeholder="Tìm luồng, đường dẫn hoặc API…"
                 className="w-full pl-8 pr-3 py-1.5 text-xs rounded-lg bg-slate-900 border border-slate-800 text-slate-100 placeholder-slate-500 focus:outline-none focus:border-indigo-500"
               />
             </div>
@@ -694,25 +718,28 @@ export default function CodeFlowWorkspacePage() {
           {/* Detected Stack Pill Row */}
           {activeRun && (
             <div className="px-3 py-2 border-b border-slate-800/80 bg-slate-950/40 flex flex-wrap gap-1">
-              {activeRun.detectedFrameworks.frontend.map((fw) => (
+              {activeRun.languages?.map((lang, idx) => (
+                <span key={`lang-${lang}-${idx}`} className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300">{lang}</span>
+              ))}
+              {activeRun.detectedFrameworks.frontend.map((fw, idx) => (
                 <span
-                  key={fw}
+                  key={`fe-${fw}-${idx}`}
                   className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-300 border border-emerald-500/20"
                 >
                   {fw}
                 </span>
               ))}
-              {activeRun.detectedFrameworks.backend.map((fw) => (
+              {activeRun.detectedFrameworks.backend.map((fw, idx) => (
                 <span
-                  key={fw}
+                  key={`be-${fw}-${idx}`}
                   className="text-[10px] px-1.5 py-0.5 rounded bg-indigo-500/10 text-indigo-300 border border-indigo-500/20"
                 >
                   {fw}
                 </span>
               ))}
-              {activeRun.detectedFrameworks.database.map((fw) => (
+              {activeRun.detectedFrameworks.database.map((fw, idx) => (
                 <span
-                  key={fw}
+                  key={`db-${fw}-${idx}`}
                   className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-300 border border-amber-500/20"
                 >
                   {fw}
@@ -725,22 +752,57 @@ export default function CodeFlowWorkspacePage() {
           <div className="flex-1 overflow-y-auto p-3 space-y-4">
             <div>
               <div className="flex items-center justify-between text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-2">
-                <span>Luồng nghiệp vụ & API ({filteredFlows.length})</span>
+                <span>Luồng trong mã nguồn ({filteredFlows.length})</span>
+              </div>
+              {/* Flow Category Filter Pills */}
+              <div className="grid grid-cols-4 gap-1 mb-2.5 p-1 rounded-lg bg-slate-900/90 border border-slate-800 text-[10px]">
+                <button
+                  onClick={() => setFlowKindFilter('all')}
+                  className={`py-1 rounded font-medium transition ${
+                    flowKindFilter === 'all' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  Tất cả
+                </button>
+                <button
+                  onClick={() => setFlowKindFilter('endpoint')}
+                  className={`py-1 rounded font-medium transition ${
+                    flowKindFilter === 'endpoint' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  API ({activeRun?.featureFlows.filter((f) => (f.kind || 'endpoint') === 'endpoint').length || 0})
+                </button>
+                <button
+                  onClick={() => setFlowKindFilter('code')}
+                  className={`py-1 rounded font-medium transition ${
+                    flowKindFilter === 'code' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  Gọi hàm ({activeRun?.featureFlows.filter((f) => f.kind === 'code').length || 0})
+                </button>
+                <button
+                  onClick={() => setFlowKindFilter('modules')}
+                  className={`py-1 rounded font-medium transition ${
+                    flowKindFilter === 'modules' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  File ({activeRun?.featureFlows.filter((f) => f.kind === 'modules').length || 0})
+                </button>
               </div>
               <div className="space-y-1.5">
                 {filteredFlows.length === 0 ? (
                   <div className="p-3 rounded-xl bg-slate-900/40 border border-slate-800 text-center">
-                    <p className="text-xs text-slate-400">Không có luồng API riêng lẻ.</p>
-                    <p className="text-[11px] text-slate-500 mt-1">Hãy xem Sơ đồ ERD hoặc Kiến trúc tổng thể ở bên dưới.</p>
+                    <p className="text-xs text-slate-400">Không tìm thấy luồng phù hợp.</p>
+                    <p className="text-[11px] text-slate-500 mt-1">{searchQuery ? 'Thử tìm bằng tên file hoặc endpoint.' : 'Phân tích lại để cập nhật sơ đồ mã nguồn.'}</p>
                   </div>
                 ) : (
-                  filteredFlows.map((flow) => {
+                  filteredFlows.map((flow, flowIdx) => {
                   const isSelected =
                     activeFlow?.id === flow.id &&
                     (activeTab === 'flowchart' || activeTab === 'sequence');
                   return (
                     <button
-                      key={flow.id}
+                      key={`${flow.id}-${flowIdx}`}
                       onClick={() => {
                         if (activeProject && activeRun) {
                           if (activeTab !== 'flowchart' && activeTab !== 'sequence') {
@@ -765,7 +827,7 @@ export default function CodeFlowWorkspacePage() {
                               : 'bg-sky-500/20 text-sky-300'
                           }`}
                         >
-                          {flow.httpMethod}
+                          {flow.httpMethod || (flow.kind === 'modules' ? 'FILE' : 'CODE')}
                         </span>
                         <span className="text-[11px] font-mono text-slate-400 truncate flex-1">
                           {flow.endpointPath}
@@ -797,7 +859,7 @@ export default function CodeFlowWorkspacePage() {
                 >
                   <span className="flex items-center gap-2">
                     <Database className="w-3.5 h-3.5 text-amber-400" />
-                    <span>Sơ đồ ERD Database MySQL</span>
+                    <span>Sơ đồ quan hệ dữ liệu</span>
                   </span>
                   <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-amber-300">
                     {activeRun?.stats.tablesCount || 0} bảng
@@ -814,7 +876,7 @@ export default function CodeFlowWorkspacePage() {
                 >
                   <span className="flex items-center gap-2">
                     <Layers className="w-3.5 h-3.5 text-cyan-400" />
-                    <span>Kiến trúc tổng thể (FE → BE → DB)</span>
+                    <span>Kiến trúc tổng thể</span>
                   </span>
                 </button>
 
@@ -891,7 +953,10 @@ export default function CodeFlowWorkspacePage() {
                 1. Flowchart (Luồng xử lý)
               </button>
               <button
-                onClick={() => setActiveTab('sequence')}
+                onClick={() => {
+                  if (activeTab === 'erd' && activeProject && activeRun && activeFlow) loadFlowDiagram(activeProject, activeRun.id, activeFlow.id);
+                  setActiveTab('sequence');
+                }}
                 className={`px-3 py-1 rounded-lg text-xs font-medium transition ${
                   activeTab === 'sequence'
                     ? 'bg-indigo-600 text-white shadow'
@@ -908,7 +973,7 @@ export default function CodeFlowWorkspacePage() {
                     : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
-                3. ERD (MySQL Schema)
+                3. ERD (Schema)
               </button>
               <button
                 onClick={() => setActiveTab('architecture')}
@@ -1033,8 +1098,12 @@ export default function CodeFlowWorkspacePage() {
 
           {/* MAIN VIEW CONTENT */}
           <div className="flex-1 relative overflow-hidden">
-            {(activeTab === 'flowchart' || activeTab === 'erd') && (
+            {activeTab === 'erd' && !nodes.length && (
+              <p className="p-6 text-sm text-slate-400">Chưa tìm thấy khai báo bảng dữ liệu trong mã nguồn.</p>
+            )}
+            {(activeTab === 'flowchart' || (activeTab === 'erd' && nodes.length > 0)) && (
               <InteractiveFlowCanvas
+                key={`${activeRun?.id}-${activeTab}-${activeFlowId}`}
                 nodesData={nodes}
                 edgesData={edges}
                 direction={direction}
@@ -1047,12 +1116,13 @@ export default function CodeFlowWorkspacePage() {
             {activeTab === 'sequence' && (
               <div className="w-full h-full flex flex-col">
                 <div className="flex-1 overflow-auto">
-                  <MermaidViewer code={currentMermaidCode} idSuffix="seq" />
+                  {currentMermaidCode ? <MermaidViewer code={currentMermaidCode} idSuffix="seq" /> :
+                    <p className="p-6 text-sm text-slate-400">Sơ đồ này chỉ có file hoặc khai báo. Chọn một luồng có lời gọi để xem thứ tự liên kết trong mã nguồn.</p>}
                 </div>
                 {/* Quick clickable chips below sequence diagram to inspect any participant's source code */}
                 <div className="p-3 bg-slate-900/90 border-t border-slate-800 flex items-center gap-2 overflow-x-auto">
                   <span className="text-xs text-slate-400 shrink-0">
-                    Truy vết các bước trong Sequence Diagram:
+                    Thành phần trong luồng:
                   </span>
                   {nodes.map((n) => (
                     <button
@@ -1072,7 +1142,7 @@ export default function CodeFlowWorkspacePage() {
             )}
 
             {activeTab === 'architecture' && (
-              <MermaidViewer code={architectureMermaidCode} idSuffix="arch" />
+              <MermaidViewer code={currentMermaidCode} idSuffix="arch" />
             )}
 
             {/* SECTION 7.3: TRACE FROM CODE TO DIAGRAM */}
@@ -1086,7 +1156,7 @@ export default function CodeFlowWorkspacePage() {
                   </h3>
                   <input
                     type="text"
-                    value={codeTraceQuery}
+                    value={codeTraceQuery ?? ''}
                     onChange={(e) => setCodeTraceQuery(e.target.value)}
                     placeholder="Nhập tên hàm, class, bảng, file..."
                     className="w-full px-3 py-1.5 text-xs rounded-lg bg-slate-900 border border-slate-700 text-slate-100 focus:outline-none focus:border-indigo-500"
@@ -1122,7 +1192,7 @@ export default function CodeFlowWorkspacePage() {
                       Kết quả truy vết Code → Sơ đồ ({traceSymbolsMatchingCode.length} thành phần)
                     </h2>
                     <p className="text-xs text-slate-400 mt-0.5">
-                      Hiển thị các sơ đồ có chứa file/function này, các thành phần gọi đến nó, được nó gọi, các API và bảng MySQL liên quan.
+                      Hiển thị các sơ đồ có chứa file/function này, các thành phần gọi đến nó, được nó gọi, các API và bảng dữ liệu liên quan.
                     </p>
                   </div>
 
@@ -1203,7 +1273,7 @@ export default function CodeFlowWorkspacePage() {
                                       key={cf.id}
                                       className="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 text-[11px]"
                                     >
-                                      {cf.httpMethod} {cf.endpointPath}
+                                      {cf.endpointPath ? `${cf.httpMethod} ${cf.endpointPath}` : cf.name}
                                     </span>
                                   ))}
                                 </div>
@@ -1215,9 +1285,9 @@ export default function CodeFlowWorkspacePage() {
                                 Thành phần gọi đến nó ({callers.length}):
                               </span>
                               <div className="flex flex-wrap gap-1">
-                                {callers.map((c) => (
+                                {callers.map((c, cIdx) => (
                                   <span
-                                    key={c!.id}
+                                    key={`caller-${c!.id}-${cIdx}`}
                                     className="px-2 py-0.5 rounded bg-slate-800 text-slate-200 font-mono text-[11px]"
                                   >
                                     {c!.label}
@@ -1231,9 +1301,9 @@ export default function CodeFlowWorkspacePage() {
                                 Thành phần được nó gọi ({callees.length}):
                               </span>
                               <div className="flex flex-wrap gap-1">
-                                {callees.map((c) => (
+                                {callees.map((c, cIdx) => (
                                   <span
-                                    key={c!.id}
+                                    key={`callee-${c!.id}-${cIdx}`}
                                     className="px-2 py-0.5 rounded bg-slate-800 text-cyan-300 font-mono text-[11px]"
                                   >
                                     {c!.label}
@@ -1300,7 +1370,18 @@ export default function CodeFlowWorkspacePage() {
             </div>
 
             <form onSubmit={handleCreateProjectSubmit} className="p-5 space-y-4 text-xs">
-              <div className="grid grid-cols-2 gap-2 p-1 rounded-xl bg-slate-900 border border-slate-800">
+              <div className="grid grid-cols-3 gap-1.5 p-1 rounded-xl bg-slate-900 border border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setUploadMode('folder')}
+                  className={`py-2 rounded-lg font-medium transition ${
+                    uploadMode === 'folder'
+                      ? 'bg-indigo-600 text-white'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  1. Chọn Thư mục
+                </button>
                 <button
                   type="button"
                   onClick={() => setUploadMode('zip')}
@@ -1310,7 +1391,7 @@ export default function CodeFlowWorkspacePage() {
                       : 'text-slate-400 hover:text-slate-200'
                   }`}
                 >
-                  Phương thức 1: Upload File ZIP
+                  2. Upload File ZIP
                 </button>
                 <button
                   type="button"
@@ -1321,18 +1402,17 @@ export default function CodeFlowWorkspacePage() {
                       : 'text-slate-400 hover:text-slate-200'
                   }`}
                 >
-                  Phương thức 2: Đường dẫn Thư mục
+                  3. Nhập Đường dẫn
                 </button>
               </div>
 
               <div>
-                <label className="block text-slate-300 font-medium mb-1">Tên dự án (Project Name)</label>
+                <label className="block text-slate-300 font-medium mb-1">Tên dự án (Tùy chọn - tự động điền nếu để trống)</label>
                 <input
                   type="text"
-                  required
-                  value={newProjName}
+                  value={newProjName ?? ''}
                   onChange={(e) => setNewProjName(e.target.value)}
-                  placeholder="VD: E-Commerce Laravel + Vue"
+                  placeholder="VD: GearK E-Commerce / TikTok Game..."
                   className="w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-slate-100 focus:outline-none focus:border-indigo-500"
                 />
               </div>
@@ -1341,17 +1421,43 @@ export default function CodeFlowWorkspacePage() {
                 <label className="block text-slate-300 font-medium mb-1">Mô tả dự án</label>
                 <input
                   type="text"
-                  value={newProjDesc}
+                  value={newProjDesc ?? ''}
                   onChange={(e) => setNewProjDesc(e.target.value)}
                   placeholder="Mô tả ngắn gọn về hệ thống..."
                   className="w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-slate-100 focus:outline-none focus:border-indigo-500"
                 />
               </div>
 
-              {uploadMode === 'zip' ? (
+              {uploadMode === 'folder' ? (
                 <div>
                   <label className="block text-slate-300 font-medium mb-1">
-                    Chọn file ZIP Source Code (Laravel / Vue / Nuxt / MySQL)
+                    Chọn trực tiếp thư mục dự án từ máy tính (Tự động lọc bỏ node_modules, .git, dist)
+                  </label>
+                  <input
+                    type="file"
+                    {...({ webkitdirectory: 'true', directory: 'true' } as any)}
+                    multiple
+                    onChange={(e) => {
+                      const files = Array.from(e.target.files || []);
+                      setFolderFiles(files);
+                      if (files.length > 0 && !newProjName) {
+                        const rel = files[0].webkitRelativePath || '';
+                        const root = rel.split('/')[0];
+                        if (root) setNewProjName(root);
+                      }
+                    }}
+                    className="w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-slate-300"
+                  />
+                  {folderFiles.length > 0 && (
+                    <p className="mt-1.5 text-[11px] text-cyan-400">
+                      Đã chọn thư mục ({folderFiles.length} tổng số file, hệ thống sẽ tự lọc lấy file source code).
+                    </p>
+                  )}
+                </div>
+              ) : uploadMode === 'zip' ? (
+                <div>
+                  <label className="block text-slate-300 font-medium mb-1">
+                    Chọn file ZIP chứa mã nguồn dự án
                   </label>
                   <input
                     type="file"
@@ -1367,9 +1473,9 @@ export default function CodeFlowWorkspacePage() {
                   </label>
                   <input
                     type="text"
-                    value={newProjLocalPath}
+                    value={newProjLocalPath ?? ''}
                     onChange={(e) => setNewProjLocalPath(e.target.value)}
-                    placeholder="VD: c:\vinhnq\diagram-AI\sample-projects\sharespend"
+                    placeholder="VD: C:\vinhnq\GearK_v1 hoặc C:\vinhnq\tiktok_game"
                     className="w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-slate-100 font-mono focus:outline-none focus:border-indigo-500"
                   />
                 </div>
@@ -1420,7 +1526,7 @@ export default function CodeFlowWorkspacePage() {
                 <input
                   type="text"
                   required
-                  value={manualNodeLabel}
+                  value={manualNodeLabel ?? ''}
                   onChange={(e) => setManualNodeLabel(e.target.value)}
                   placeholder="VD: Redis Cache / External Payment Gateway"
                   className="w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-white"
@@ -1443,7 +1549,7 @@ export default function CodeFlowWorkspacePage() {
                 <label className="block text-slate-300 mb-1">Mô tả chi tiết</label>
                 <textarea
                   rows={3}
-                  value={manualNodeDesc}
+                  value={manualNodeDesc ?? ''}
                   onChange={(e) => setManualNodeDesc(e.target.value)}
                   placeholder="Ghi chú vai trò của thành phần này..."
                   className="w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-white"
@@ -1629,11 +1735,12 @@ export default function CodeFlowWorkspacePage() {
                 <div className="flex gap-2">
                   <input
                     readOnly
-                    value={`https://codeflow.local/share/${activeDiagram.shareToken}`}
+                    value={activeDiagram?.shareToken ? `https://codeflow.local/share/${activeDiagram.shareToken}` : ''}
                     className="flex-1 px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 font-mono text-slate-300"
                   />
                   <button
                     onClick={() => {
+                      if (!activeDiagram?.shareToken) return;
                       navigator.clipboard.writeText(
                         `https://codeflow.local/share/${activeDiagram.shareToken}`
                       );
